@@ -12,8 +12,9 @@ A Python library for searching and retrieving images based on various criteria u
 
 ## Installation
 
+install python dependencies
 ```bash
-pip install python-image-search
+pip install requests pymysql python-dotenv
 ```
 
 Pull Model AI Lokal (Ollama)
