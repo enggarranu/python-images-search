@@ -1,5 +1,6 @@
 import os
 import base64
+import hashlib
 import requests
 import pymysql
 from dotenv import load_dotenv
@@ -13,8 +14,9 @@ load_dotenv()
 OLLAMA_API = os.getenv('OLLAMA_API')
 IMAGE_FOLDER = os.getenv('IMAGE_FOLDER') 
 
-VISION_MODEL = os.getenv('VISION_MODEL', 'llava:7b')
-EMBED_MODEL = os.getenv('EMBED_MODEL', 'nomic-embed-text')
+VISION_MODEL = os.getenv('VISION_MODEL') or 'llava:7b'
+EMBED_MODEL = os.getenv('EMBED_MODEL') or 'nomic-embed-text'
+REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', 30))
 
 def connect_db():
     return pymysql.connect(
@@ -38,55 +40,67 @@ def index_images():
     cursor = conn.cursor()
     
     print(f"Memulai proses indexing pada folder: {IMAGE_FOLDER}\n")
+    exts = ('.png', '.jpg', '.jpeg', '.heic')
+    file_paths = []
+    for root, _, names in os.walk(IMAGE_FOLDER):
+        for name in names:
+            if name.lower().endswith(exts):
+                file_paths.append(os.path.join(root, name))
+    total = len(file_paths)
+    if total == 0:
+        print("Tidak ada file gambar yang ditemukan.")
+        conn.close()
+        return
     
-    for filename in os.listdir(IMAGE_FOLDER):
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-            image_path = os.path.join(IMAGE_FOLDER, filename)
-            print(f"⏳ Memproses: {filename}...")
+    for idx, image_path in enumerate(file_paths, 1):
+        filename = os.path.basename(image_path)
+        pct = int(((idx - 1) / total) * 100)
+        print(f"⏳ Memproses ({idx}/{total}, ~{pct}%): {filename}...")
+        
+        try:
+            img_b64 = encode_image(image_path)
+            vision_payload = {
+                "model": VISION_MODEL,
+                "prompt": "Describe this image in detail. What is happening? What objects are present? Reply strictly in English.",
+                "images": [img_b64],
+                "stream": False
+            }
+            res_vision = requests.post(f"{OLLAMA_API}/generate", json=vision_payload, timeout=REQUEST_TIMEOUT).json()
+            description_en = res_vision.get('response', '')
             
-            try:
-                # 1. Vision: Ekstrak deskripsi bahasa Inggris
-                img_b64 = encode_image(image_path)
-                vision_payload = {
-                    "model": VISION_MODEL,
-                    "prompt": "Describe this image in detail. What is happening? What objects are present? Reply strictly in English.",
-                    "images": [img_b64],
-                    "stream": False
-                }
-                res_vision = requests.post(f"{OLLAMA_API}/generate", json=vision_payload).json()
-                description_en = res_vision.get('response', '')
-                
-                # 2. Translate: Terjemahkan ke Bahasa Indonesia
-                print("   🔄 Menerjemahkan ke Bahasa Indonesia...")
-                description_id = translate_text(description_en, "Indonesian")
-                
-                # 3. Embedding: Gunakan versi Inggris agar akurasi Nomic maksimal
-                embed_payload = {
-                    "model": EMBED_MODEL,
-                    "prompt": description_en
-                }
-                res_embed = requests.post(f"{OLLAMA_API}/embeddings", json=embed_payload).json()
-                vector = res_embed.get('embedding', [])
-                
-                # 4. Simpan ke TiDB (Masukkan kedua deskripsi)
-                vector_str = "[" + ",".join(map(str, vector)) + "]"
-                
-                # Update SQL untuk memasukkan file_path
-                sql = """
-                    INSERT INTO image_vectors 
-                    (image_name, file_path, description, description_id, embedding) 
-                    VALUES (%s, %s, %s, %s, %s)
-                """
-                
-                # Masukkan image_path ke dalam eksekusi
-                cursor.execute(sql, (filename, image_path, description_en, description_id, vector_str))
-                conn.commit()
-                            
-                print(f"✅ Selesai: {filename} (Disimpan ke TiDB)")
-                
-            except Exception as e:
-                print(f"❌ Error memproses {filename}: {e}")
-                
+            print("   🔄 Menerjemahkan ke Bahasa Indonesia...")
+            description_id = translate_text(description_en, "Indonesian")
+            
+            embed_payload = {
+                "model": EMBED_MODEL,
+                "prompt": description_en
+            }
+            res_embed = requests.post(f"{OLLAMA_API}/embeddings", json=embed_payload, timeout=REQUEST_TIMEOUT).json()
+            vector = res_embed.get('embedding', [])
+            vector_str = "[" + ",".join(map(str, vector)) + "]"
+            
+            path_hash = hashlib.md5(image_path.encode('utf-8')).hexdigest()
+            sql_upsert = """
+                INSERT INTO image_vectors 
+                (image_name, file_path, path_hash, description, description_id, embedding) 
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE 
+                  file_path=VALUES(file_path),
+                  path_hash=VALUES(path_hash),
+                  description=VALUES(description),
+                  description_id=VALUES(description_id),
+                  embedding=VALUES(embedding),
+                  updated_at=CURRENT_TIMESTAMP
+            """
+            cursor.execute(sql_upsert, (filename, image_path, path_hash, description_en, description_id, vector_str))
+            action = "Diupdate" if cursor.rowcount == 2 else "Disimpan"
+            conn.commit()
+            done_pct = int((idx / total) * 100)
+            print(f"✅ {action}: {filename} (Progress {idx}/{total}, {done_pct}%)")
+            
+        except Exception as e:
+            print(f"❌ Error memproses {filename}: {e}")
+            
     conn.close()
     print("\nProses Indexing Selesai!")
 
@@ -106,7 +120,7 @@ def search_images(search_query, limit=3):
         
         # 2. Ubah kueri Inggris menjadi vektor
         embed_payload = {"model": EMBED_MODEL, "prompt": query_en}
-        res_embed = requests.post(f"{OLLAMA_API}/embeddings", json=embed_payload).json()
+        res_embed = requests.post(f"{OLLAMA_API}/embeddings", json=embed_payload, timeout=REQUEST_TIMEOUT).json()
         query_vector = "[" + ",".join(map(str, res_embed['embedding'])) + "]"
         
         # 3. Ambil hasil dari TiDB (panggil juga kolom file_path)
@@ -121,8 +135,12 @@ def search_images(search_query, limit=3):
             ORDER BY distance ASC 
             LIMIT %s
         """
+        #debug
+        print("SQL Query:", sql)
+        print("Parameters:", (query_vector, limit))
         cursor.execute(sql, (query_vector, limit))
         results = cursor.fetchall()
+        
         
         print("\n--- Hasil Pencarian Teratas ---")
         for idx, row in enumerate(results, 1):
@@ -148,10 +166,11 @@ def translate_text(text, target_lang="Indonesian"):
     payload = {
         "model": os.getenv('TRANSLATE_MODEL', 'llava:7b'),
         "prompt": f"Translate the following text to {target_lang}. Only output the translation directly without any introductory words or quotes.\n\nText: {text}",
-        "stream": False
+        "stream": False,
+        "options": {"temperature": 0, "num_ctx": 2048, "max_tokens": 256}
     }
     try:
-        res = requests.post(f"{OLLAMA_API}/generate", json=payload).json()
+        res = requests.post(f"{OLLAMA_API}/generate", json=payload, timeout=REQUEST_TIMEOUT).json()
         return res.get('response', '').strip()
     except Exception as e:
         print(f"⚠️ Gagal menerjemahkan: {e}")

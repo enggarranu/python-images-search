@@ -7,7 +7,7 @@ CLI Python untuk melakukan indexing gambar dan pencarian semantik menggunakan Ol
 
 - Indexing gambar dari folder lokal (otomatis membuat deskripsi EN dan terjemahan ID)
 - Pencarian semantik berbasis vektor dengan peringkat `VEC_COSINE_DISTANCE`
-- Mendukung format `.png`, `.jpg`, `.jpeg`
+- Mendukung format `.png`, `.jpg`, `.jpeg`, `.heic`
 - Menu CLI interaktif yang mudah digunakan
 
 ## Prasyarat
@@ -68,8 +68,9 @@ CREATE TABLE IF NOT EXISTS image_vectors (
   description_id TEXT,
   embedding VECTOR<FLOAT>(768),
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+  UNIQUE KEY uk_image_path_name (image_name, file_path)
 ```
+
 
 Catatan: Model `nomic-embed-text` menghasilkan vektor berdimensi 768, sehingga tipe vektor pada tabel diatur ke `VECTOR<FLOAT>(768)`.
 
