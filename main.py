@@ -45,31 +45,43 @@ def index_images():
             print(f"⏳ Memproses: {filename}...")
             
             try:
-                # 1. Vision: Ekstrak deskripsi gambar dengan Llava
+                # 1. Vision: Ekstrak deskripsi bahasa Inggris
                 img_b64 = encode_image(image_path)
                 vision_payload = {
                     "model": VISION_MODEL,
-                    "prompt": "Describe this image in detail. What is happening? What objects are present? Reply in English.",
+                    "prompt": "Describe this image in detail. What is happening? What objects are present? Reply strictly in English.",
                     "images": [img_b64],
                     "stream": False
                 }
                 res_vision = requests.post(f"{OLLAMA_API}/generate", json=vision_payload).json()
-                description = res_vision.get('response', '')
+                description_en = res_vision.get('response', '')
                 
-                # 2. Embedding: Ubah teks menjadi Vektor dengan Nomic
+                # 2. Translate: Terjemahkan ke Bahasa Indonesia
+                print("   🔄 Menerjemahkan ke Bahasa Indonesia...")
+                description_id = translate_text(description_en, "Indonesian")
+                
+                # 3. Embedding: Gunakan versi Inggris agar akurasi Nomic maksimal
                 embed_payload = {
                     "model": EMBED_MODEL,
-                    "prompt": description
+                    "prompt": description_en
                 }
                 res_embed = requests.post(f"{OLLAMA_API}/embeddings", json=embed_payload).json()
                 vector = res_embed.get('embedding', [])
                 
-                # 3. Simpan ke TiDB (Format array Python -> String list "[0.1, 0.2, ...]")
+                # 4. Simpan ke TiDB (Masukkan kedua deskripsi)
                 vector_str = "[" + ",".join(map(str, vector)) + "]"
-                sql = "INSERT INTO image_vectors (image_name, description, embedding) VALUES (%s, %s, %s)"
-                cursor.execute(sql, (filename, description, vector_str))
-                conn.commit()
                 
+                # Update SQL untuk memasukkan file_path
+                sql = """
+                    INSERT INTO image_vectors 
+                    (image_name, file_path, description, description_id, embedding) 
+                    VALUES (%s, %s, %s, %s, %s)
+                """
+                
+                # Masukkan image_path ke dalam eksekusi
+                cursor.execute(sql, (filename, image_path, description_en, description_id, vector_str))
+                conn.commit()
+                            
                 print(f"✅ Selesai: {filename} (Disimpan ke TiDB)")
                 
             except Exception as e:
@@ -85,20 +97,25 @@ def search_images(search_query, limit=3):
     conn = connect_db()
     cursor = conn.cursor()
     
-    print(f"\n🔍 Mencari gambar untuk kueri: '{search_query}'")
+    print(f"\n🔍 Kueri asli Anda: '{search_query}'")
     
     try:
-        # 1. Ubah kueri pencarian menjadi vektor
-        embed_payload = {"model": EMBED_MODEL, "prompt": search_query}
+        # 1. Translate kueri ke bahasa Inggris untuk pencarian vektor
+        query_en = translate_text(search_query, "English")
+        print(f"🧠 AI menerjemahkan kueri menjadi: '{query_en}'")
+        
+        # 2. Ubah kueri Inggris menjadi vektor
+        embed_payload = {"model": EMBED_MODEL, "prompt": query_en}
         res_embed = requests.post(f"{OLLAMA_API}/embeddings", json=embed_payload).json()
         query_vector = "[" + ",".join(map(str, res_embed['embedding'])) + "]"
         
-        # 2. Cari di TiDB menggunakan VEC_COSINE_DISTANCE
-        # Semakin kecil nilainya (mendekati 0), semakin mirip jarak vektornya.
+        # 3. Ambil hasil dari TiDB (panggil juga kolom file_path)
         sql = """
             SELECT 
                 image_name, 
-                description, 
+                file_path,
+                description,
+                description_id,
                 VEC_COSINE_DISTANCE(embedding, %s) as distance 
             FROM image_vectors 
             ORDER BY distance ASC 
@@ -109,8 +126,17 @@ def search_images(search_query, limit=3):
         
         print("\n--- Hasil Pencarian Teratas ---")
         for idx, row in enumerate(results, 1):
-            print(f"{idx}. 📸 File: {row[0]} (Skor Kedekatan: {row[2]:.4f})")
-            print(f"   💡 Deskripsi: {row[1]}\n")
+            # Penyesuaian index row karena kita menambahkan file_path di urutan ke-2 (index 1)
+            image_name = row[0]
+            file_path = row[1]
+            desc_en = row[2]
+            desc_id = row[3]
+            distance = row[4]
+            
+            print(f"{idx}. 📸 File: {image_name} (Skor Kedekatan: {distance:.4f})")
+            print(f"   📂 Lokasi: {file_path}")
+            print(f"   🇮🇩 ID: {desc_id}")
+            print(f"   🇬🇧 EN: {desc_en}\n")
             
     except Exception as e:
         print(f"❌ Error saat pencarian: {e}")
@@ -118,6 +144,19 @@ def search_images(search_query, limit=3):
     finally:
         conn.close()
 
+def translate_text(text, target_lang="Indonesian"):
+    payload = {
+        "model": TRANSLATE_MODEL,
+        "prompt": f"Translate the following text to {target_lang}. Only output the translation directly without any introductory words or quotes.\n\nText: {text}",
+        "stream": False
+    }
+    try:
+        res = requests.post(f"{OLLAMA_API}/generate", json=payload).json()
+        return res.get('response', '').strip()
+    except Exception as e:
+        print(f"⚠️ Gagal menerjemahkan: {e}")
+        return text # Jika gagal, kembalikan teks aslinya
+    
 if __name__ == "__main__":
     while True:
         print("\n" + "="*45)
