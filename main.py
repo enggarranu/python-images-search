@@ -146,7 +146,7 @@ def search_images(search_query, limit=3):
 
 def translate_text(text, target_lang="Indonesian"):
     payload = {
-        "model": TRANSLATE_MODEL,
+        "model": os.getenv('TRANSLATE_MODEL', 'llava:7b'),
         "prompt": f"Translate the following text to {target_lang}. Only output the translation directly without any introductory words or quotes.\n\nText: {text}",
         "stream": False
     }
